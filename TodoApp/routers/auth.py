@@ -1,14 +1,38 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from models import Users
 from passlib.context import CryptContext
 from starlette import status
+# 요청에 대한 사용자 이름과 암호를 얻을 수 있음
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
+    # Endpoint를 위한 종속성 주입으로 사용해야 함.
+    # OAuth2 암호 요청 양식으로 사용자 이름과 암호 사용
+    # OAuth2PasswordBearer
+        # FastAPI에게 요청을 처리하기 전에 전달자 토큰을 확인함.
+from jose import jwt, JWTError
+    # 비밀키와 알고리즘이 필요함
+from datetime import timedelta, datetime
 
-router = APIRouter()
+router = APIRouter(
+    # 이 파일에서 모든 api endpoint는 /auth로 시작
+    prefix='/auth',
+    # swagger 문서 상에서 구분되는 태그
+    tags=['auth']
+)
+
+# 그냥 키 설정 이므로 아무거나 지정하면 됨 : openssl rand -hex 32
+SECRET_KEY = '6837ab0fb4b0f4dd293016039a002e76bac916a66b8e873644f8d5f82ee6f0aa'
+ALGORITHM='HS256'
 
 # CryptContext를 bcrypt로 사용할 새 변수 생성
 bcrypt_context = CryptContext(schemes=['bcrypt'],
                               deprecated="auto")
+# API 요청에 종속성을 부여하기 위해 토큰을 확인해야 함
+# prifix로 endpoint가 바뀌면 같이 바꿔줘야 함
+oauth2_bearer = OAuth2PasswordBearer(tokenUrl='auth/token')
+    # tokenUrl : 클라이언트가 토큰을 요청하는 엔드포인트의 경로
+    # POST 요청을 보낼 URL을 지정
+    # /auth/token 엔드포인트에서 로그인을 처리하고 JWT 토큰을 발급해 줘야함.
 
 
 # 필드 유효성 검사를 위한 pydantic 만들기
@@ -23,6 +47,14 @@ class CreateUserRequest(BaseModel):
     last_name: str
     password: str
     role: str
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+
 
 # DB Dependency
 from database import SessionLocal
@@ -57,8 +89,49 @@ db_dependency = Annotated[Session, Depends(get_db)]
 
 
 
+# 사용자 인증값이 db와 맞는지 확인하는 함수 = 사용자가 입력한 비밀번호가 맞는지 확인하
+def authenticate_user(username: str, password: str, db):
+    user = db.query(Users).filter(Users.username == username).first()
+    if not user:
+        # 유저가 존재하지 않으면 False 반환.
+        return False
+    # 유저가 입력한 비번을 해시하여 DB의 해시된 비번과 비교
+    if not bcrypt_context.verify(password, user.hashed_password):
+        # 유저가 존재하지만 비밀번호가 틀리면 False 반환.
+        return False
+    # 유저가 존재하고, 비밀번호도 맞으면 user 객체를 반환
+    return user
 
-@router.post("/auth", status_code=status.HTTP_201_CREATED)
+# 엑세스 토큰 생성
+def create_access_token(username: str, user_id: int,
+                        expires_delta: timedelta):
+    # JWT에 추가할 인코딩 생성
+    encode = {'sub': username, 'id': user_id}
+    # 만료된 토큰 찾았을 때
+    expires = datetime.now() + expires_delta
+    encode.update({'exp': expires})
+    return jwt.encode(encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+async def get_current_user(token: Annotated[str, Depends(oauth2_bearer)]):
+    # Depends(oauth2_bearer) : 사용자를 먼저 확보해 전달되는 토큰 확인
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get('sub')
+        user_id: int = payload.get('id')
+
+        if username is None or user_id is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                                detail="Could not validation user.")
+        return {"username": username, 'id': user_id}
+    # JWT 오류가 나도 똑같은 HTTP 예외를 표시하고 싶음
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                                detail="Could not validation user.")
+
+
+
+@router.post("/", status_code=status.HTTP_201_CREATED)
 # CreateUserRequest : 사용자가 입력한 값이 우리의 양식에 맞는지 확인하기 위함
 async def create_user(db: db_dependency,
                       create_user_request: CreateUserRequest):
@@ -97,8 +170,19 @@ async def create_user(db: db_dependency,
 
 
 # 사용자 인증
-# 사용자 이름과 비밀번호 입력받아서 인증
+# 1. 사용자 이름과 비밀번호 입력받아서 인증
+# 2. JWT를 사용해서 사용자 이름과 비번을 암호화 
+@router.post("/token", response_model=Token)
+    # response_model를 적용하면 반환값이 무조건 모델대로 나와야 함
+    # 아니면 에러 발생
+async def login_for_access_token(form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+                                 db: db_dependency):
+    # Depends()를 사용하면 FastAPI가 자동으로 요청의 바디에서 username과 password를 추출
+    # 클라이언트가 POST 요청을 보내면 FastAPI가 자동으로 OAuth2PasswordRequestForm 객체를 만들어서 form_data에 넣어줌.
+    user = authenticate_user(form_data.username, form_data.password, db)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                                detail="Could not validation user.")
+    token = create_access_token(user.username, user.id, timedelta(minutes=20))
 
-@router.post("/token")
-async def login_for_access_token():
-    return 'token'
+    return {"access_token": token, 'token_type': 'bearer'}
