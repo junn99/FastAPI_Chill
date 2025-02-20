@@ -5,6 +5,9 @@ from models import Todos
 from starlette import status
 from database import SessionLocal
 
+# 사용자 기능을 통해 JWT 인증을 할 수 있으니 todo로 연동
+from .auth import get_current_user
+
 
 router = APIRouter()
 
@@ -33,6 +36,9 @@ def get_db():
 
 ## 종속성
 db_dependency = Annotated[Session, Depends(get_db)]
+### 유저 종속성 = 사용자 의존성
+    # 사용자 먼저 유효성 검사를 받게 함
+user_dependency = Annotated[dict, Depends(get_current_user)]
 
 
 # Pydantic request
@@ -48,33 +54,62 @@ class TodoRequest(BaseModel):
     complete: bool
 
 
-@router.get("/")
-async def read_all(db: db_dependency):
+@router.get("/", status_code=status.HTTP_200_OK)
+async def read_all(user: user_dependency, 
+                   db: db_dependency, ):
+    if user is None:
+        raise HTTPException(status_code=401, detail="Autentication Failed")
     # Todos 테이블의 모든 데이터를 조회
-    return db.query(Todos).all()
+    # return db.query(Todos).all()
+
+    # 유저에 따른 필터로 모든 데이터 조회
+    return db.query(Todos).filter(Todos.owner_id == user.get('id')).all()
 
 
 @router.get("/todo/{todo_id}", status_code=status.HTTP_200_OK)
-async def read_todo(db: db_dependency, todo_id: int = Path(gt=0)):
-    todo_model = db.query(Todos).filter(Todos.id == todo_id).first()
+async def read_todo(user: user_dependency,
+                    db: db_dependency, 
+                    todo_id: int = Path(gt=0)):
+    # 사용자 종속성과 세트 구문
+    if user is None:
+        raise HTTPException(status_code=401, detail="Autentication Failed")
+    todo_model = db.query(Todos).filter(Todos.id == todo_id)\
+        .filter(Todos.owner_id == user.get('id')).first()
     if todo_model is not None:
         return todo_model
     raise HTTPException(status_code=404, detail="Todo not found.")
 
 #POST
 @router.post("/todo", status_code=status.HTTP_201_CREATED)
-async def create_todo(db: db_dependency, todo_request: TodoRequest):
-    todo_model = Todos(**todo_request.dict())
+async def create_todo(user: user_dependency,
+                        # 현재 사용자를 확보할 때 종속성 주입에서 반환된 정보 가짐
+                        # Swagger에서 확인할 때 잠금 표시 : 사용자 인증 필요
+                      db: db_dependency, 
+                      todo_request: TodoRequest):
+    # 1. 해당 사용자가 유효한 지 확인
+    if user is None:
+        raise HTTPException(status_code=401, detail="Autentication Failed")
+    # 2. todo_request를 변환한 후에도 todo_model은 owner_id를 가지지 않음
+        # owner_id : 외래키
+        # 그래서 추가 필요
+    todo_model = Todos(**todo_request.model_dump(), owner_id=user.get('id'))
+        # 사용자 id와 같은 걸로 owner_id도 추가
+
     db.add(todo_model)
     db.commit()
 
 
 # PUT
 @router.put("/todo/{todo_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def update_todo(db: db_dependency, 
+async def update_todo(user: user_dependency,
+                      db: db_dependency, 
                       todo_request: TodoRequest,
                       todo_id: int = Path(gt=0)):
-    todo_model = db.query(Todos).filter(Todos.id == todo_id).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="Autentication Failed")
+    
+    todo_model = db.query(Todos).filter(Todos.id == todo_id)\
+        .filter(Todos.owner_id == user.get('id')).first()
     if todo_model is None:
         raise HTTPException(status_code=404, detail="Todo not found.")
     
@@ -88,14 +123,20 @@ async def update_todo(db: db_dependency,
     
 # DELETE
 @router.delete("/todo/{todo_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_todo(db: db_dependency,
+async def delete_todo(user: user_dependency,
+                      db: db_dependency,
                       todo_id: int = Path(gt=0)):
-    todo_model = db.query(Todos).filter(Todos.id == todo_id).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="Autentication Failed")
+    
+    todo_model = db.query(Todos).filter(Todos.id == todo_id)\
+        .filter(Todos.owner_id == user.get('id')).first()
     if todo_model is None:
         raise HTTPException(status_code=404,
                             detail="Todo not found.")
     
-    db.query(Todos).filter(Todos.id == todo_id).delete()
+    db.query(Todos).filter(Todos.id == todo_id)\
+        .filter(Todos.owner_id == user.get('id')).delete()
 
     db.commit()
 
